@@ -5,6 +5,9 @@
 (define-constant err-invalid-status (err u103))
 (define-constant err-already-exists (err u104))
 (define-constant err-invalid-params (err u105))
+(define-constant err-cannot-rate (err u106))
+(define-constant err-invalid-rating (err u107))
+(define-constant err-already-rated (err u108))
 
 (define-data-var application-id-nonce uint u0)
 (define-data-var employer-id-nonce uint u0)
@@ -65,6 +68,32 @@
     }
 )
 
+(define-map company-ratings
+    {
+        employer-id: uint,
+        applicant: principal,
+    }
+    {
+        interview-rating: uint,
+        communication-rating: uint,
+        process-rating: uint,
+        overall-rating: uint,
+        review-text: (string-ascii 500),
+        timestamp: uint,
+    }
+)
+
+(define-map company-rating-stats
+    { employer-id: uint }
+    {
+        total-ratings: uint,
+        interview-score: uint,
+        communication-score: uint,
+        process-score: uint,
+        overall-score: uint,
+    }
+)
+
 (define-read-only (get-application (id uint))
     (map-get? applications { id: id })
 )
@@ -99,6 +128,28 @@
 
 (define-read-only (get-application-history (application-id uint))
     (ok application-id)
+)
+
+(define-read-only (get-company-rating
+        (employer-id uint)
+        (applicant principal)
+    )
+    (map-get? company-ratings {
+        employer-id: employer-id,
+        applicant: applicant,
+    })
+)
+
+(define-read-only (get-company-rating-stats (employer-id uint))
+    (default-to {
+        total-ratings: u0,
+        interview-score: u0,
+        communication-score: u0,
+        process-score: u0,
+        overall-score: u0,
+    }
+        (map-get? company-rating-stats { employer-id: employer-id })
+    )
 )
 
 (define-public (register-employer
@@ -309,4 +360,103 @@
         (notes (string-ascii 200))
     )
     (ok (len application-ids))
+)
+
+(define-public (rate-company
+        (application-id uint)
+        (interview-rating uint)
+        (communication-rating uint)
+        (process-rating uint)
+        (review-text (string-ascii 500))
+    )
+    (let (
+            (app (unwrap! (map-get? applications { id: application-id }) err-not-found))
+            (employer-id (get employer-id app))
+            (current-stats (get-company-rating-stats employer-id))
+            (overall-rating (/ (+ interview-rating communication-rating process-rating) u3))
+            (rating-key {
+                employer-id: employer-id,
+                applicant: tx-sender,
+            })
+        )
+        (asserts! (is-eq tx-sender (get applicant app)) err-unauthorized)
+        (asserts!
+            (or
+                (is-eq (get status app) "rejected")
+                (is-eq (get status app) "accepted")
+                (is-eq (get status app) "withdrawn")
+            )
+            err-cannot-rate
+        )
+        (asserts!
+            (and
+                (<= interview-rating u5)
+                (<= communication-rating u5)
+                (<= process-rating u5)
+                (>= interview-rating u1)
+                (>= communication-rating u1)
+                (>= process-rating u1)
+            )
+            err-invalid-rating
+        )
+        (asserts! (is-none (map-get? company-ratings rating-key))
+            err-already-rated
+        )
+        (map-set company-ratings rating-key {
+            interview-rating: interview-rating,
+            communication-rating: communication-rating,
+            process-rating: process-rating,
+            overall-rating: overall-rating,
+            review-text: review-text,
+            timestamp: stacks-block-height,
+        })
+        (let (
+                (new-total (+ (get total-ratings current-stats) u1))
+                (new-interview-score (/
+                    (+
+                        (* (get interview-score current-stats)
+                            (get total-ratings current-stats)
+                        )
+                        interview-rating
+                    )
+                    new-total
+                ))
+                (new-communication-score (/
+                    (+
+                        (* (get communication-score current-stats)
+                            (get total-ratings current-stats)
+                        )
+                        communication-rating
+                    )
+                    new-total
+                ))
+                (new-process-score (/
+                    (+
+                        (* (get process-score current-stats)
+                            (get total-ratings current-stats)
+                        )
+                        process-rating
+                    )
+                    new-total
+                ))
+                (new-overall-score (/
+                    (+
+                        (* (get overall-score current-stats)
+                            (get total-ratings current-stats)
+                        )
+                        overall-rating
+                    )
+                    new-total
+                ))
+            )
+            (map-set company-rating-stats { employer-id: employer-id } {
+                total-ratings: new-total,
+                interview-score: new-interview-score,
+                communication-score: new-communication-score,
+                process-score: new-process-score,
+                overall-score: new-overall-score,
+            })
+        )
+        (ok true)
+    )
 )
