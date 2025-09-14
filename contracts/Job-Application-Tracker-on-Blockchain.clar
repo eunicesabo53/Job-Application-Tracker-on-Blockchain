@@ -8,6 +8,9 @@
 (define-constant err-cannot-rate (err u106))
 (define-constant err-invalid-rating (err u107))
 (define-constant err-already-rated (err u108))
+(define-constant err-invalid-deadline (err u109))
+(define-constant err-deadline-not-found (err u110))
+(define-constant err-deadline-passed (err u111))
 
 (define-data-var application-id-nonce uint u0)
 (define-data-var employer-id-nonce uint u0)
@@ -94,6 +97,26 @@
     }
 )
 
+(define-map application-deadlines
+    { application-id: uint }
+    {
+        deadline: uint,
+        reminder-sent: bool,
+        notes: (string-ascii 200),
+        created-at: uint,
+    }
+)
+
+(define-map user-deadline-stats
+    { user: principal }
+    {
+        total-deadlines: uint,
+        upcoming-count: uint,
+        overdue-count: uint,
+        completed-count: uint,
+    }
+)
+
 (define-read-only (get-application (id uint))
     (map-get? applications { id: id })
 )
@@ -149,6 +172,40 @@
         overall-score: u0,
     }
         (map-get? company-rating-stats { employer-id: employer-id })
+    )
+)
+
+(define-read-only (get-application-deadline (application-id uint))
+    (map-get? application-deadlines { application-id: application-id })
+)
+
+(define-read-only (get-user-deadline-stats (user principal))
+    (default-to {
+        total-deadlines: u0,
+        upcoming-count: u0,
+        overdue-count: u0,
+        completed-count: u0,
+    }
+        (map-get? user-deadline-stats { user: user })
+    )
+)
+
+(define-read-only (is-deadline-overdue (application-id uint))
+    (match (map-get? application-deadlines { application-id: application-id })
+        deadline-info (ok (> stacks-block-height (get deadline deadline-info)))
+        err-deadline-not-found
+    )
+)
+
+(define-read-only (get-upcoming-deadlines
+        (user principal)
+        (days-ahead uint)
+    )
+    (let (
+            (user-apps (get application-ids (get-user-applications user)))
+            (cutoff-block (+ stacks-block-height (* days-ahead u144)))
+        )
+        (ok (filter check-upcoming-deadline user-apps))
     )
 )
 
@@ -283,6 +340,90 @@
     )
 )
 
+(define-public (set-application-deadline
+        (application-id uint)
+        (deadline uint)
+        (notes (string-ascii 200))
+    )
+    (let (
+            (app (unwrap! (map-get? applications { id: application-id }) err-not-found))
+            (current-time stacks-block-height)
+        )
+        (asserts! (is-eq tx-sender (get applicant app)) err-unauthorized)
+        (asserts! (> deadline current-time) err-invalid-deadline)
+        (map-set application-deadlines { application-id: application-id } {
+            deadline: deadline,
+            reminder-sent: false,
+            notes: notes,
+            created-at: current-time,
+        })
+        (update-user-deadline-stats (get applicant app))
+        (ok true)
+    )
+)
+
+(define-public (update-application-deadline
+        (application-id uint)
+        (new-deadline uint)
+        (new-notes (string-ascii 200))
+    )
+    (let (
+            (app (unwrap! (map-get? applications { id: application-id }) err-not-found))
+            (deadline-info (unwrap!
+                (map-get? application-deadlines { application-id: application-id })
+                err-deadline-not-found
+            ))
+            (current-time stacks-block-height)
+        )
+        (asserts! (is-eq tx-sender (get applicant app)) err-unauthorized)
+        (asserts! (> new-deadline current-time) err-invalid-deadline)
+        (map-set application-deadlines { application-id: application-id }
+            (merge deadline-info {
+                deadline: new-deadline,
+                notes: new-notes,
+                reminder-sent: false,
+            })
+        )
+        (update-user-deadline-stats (get applicant app))
+        (ok true)
+    )
+)
+
+(define-public (remove-application-deadline (application-id uint))
+    (let ((app (unwrap! (map-get? applications { id: application-id }) err-not-found)))
+        (asserts! (is-eq tx-sender (get applicant app)) err-unauthorized)
+        (asserts!
+            (is-some (map-get? application-deadlines { application-id: application-id }))
+            err-deadline-not-found
+        )
+        (map-delete application-deadlines { application-id: application-id })
+        (update-user-deadline-stats (get applicant app))
+        (ok true)
+    )
+)
+
+(define-public (mark-deadline-reminder-sent (application-id uint))
+    (let (
+            (app (unwrap! (map-get? applications { id: application-id }) err-not-found))
+            (deadline-info (unwrap!
+                (map-get? application-deadlines { application-id: application-id })
+                err-deadline-not-found
+            ))
+        )
+        (asserts!
+            (or
+                (is-eq tx-sender (get applicant app))
+                (is-eq tx-sender contract-owner)
+            )
+            err-unauthorized
+        )
+        (map-set application-deadlines { application-id: application-id }
+            (merge deadline-info { reminder-sent: true })
+        )
+        (ok true)
+    )
+)
+
 (define-public (update-application-notes
         (application-id uint)
         (new-notes (string-ascii 500))
@@ -324,6 +465,112 @@
 
 (define-private (remove-id (id uint))
     true
+)
+
+(define-private (check-upcoming-deadline (app-id uint))
+    (match (map-get? application-deadlines { application-id: app-id })
+        deadline-info (let ((days-until (/ (- (get deadline deadline-info) stacks-block-height) u144)))
+            (and
+                (> (get deadline deadline-info) stacks-block-height)
+                (<= days-until u7)
+            )
+        )
+        false
+    )
+)
+
+(define-private (update-user-deadline-stats (user principal))
+    (let (
+            (user-apps (get application-ids (get-user-applications user)))
+            (total-deadlines (count-user-deadlines user-apps))
+            (upcoming-count (count-upcoming-deadlines user-apps))
+            (overdue-count (count-overdue-deadlines user-apps))
+            (completed-count (count-completed-deadlines user-apps))
+        )
+        (map-set user-deadline-stats { user: user } {
+            total-deadlines: total-deadlines,
+            upcoming-count: upcoming-count,
+            overdue-count: overdue-count,
+            completed-count: completed-count,
+        })
+    )
+)
+
+(define-private (count-user-deadlines (app-list (list 100 uint)))
+    (fold count-deadline app-list u0)
+)
+
+(define-private (count-upcoming-deadlines (app-list (list 100 uint)))
+    (fold count-upcoming app-list u0)
+)
+
+(define-private (count-overdue-deadlines (app-list (list 100 uint)))
+    (fold count-overdue app-list u0)
+)
+
+(define-private (count-completed-deadlines (app-list (list 100 uint)))
+    (fold count-completed app-list u0)
+)
+
+(define-private (count-deadline
+        (app-id uint)
+        (acc uint)
+    )
+    (if (is-some (map-get? application-deadlines { application-id: app-id }))
+        (+ acc u1)
+        acc
+    )
+)
+
+(define-private (count-upcoming
+        (app-id uint)
+        (acc uint)
+    )
+    (match (map-get? application-deadlines { application-id: app-id })
+        deadline-info (let ((days-until (/ (- (get deadline deadline-info) stacks-block-height) u144)))
+            (if (and
+                    (> (get deadline deadline-info) stacks-block-height)
+                    (<= days-until u7)
+                )
+                (+ acc u1)
+                acc
+            )
+        )
+        acc
+    )
+)
+
+(define-private (count-overdue
+        (app-id uint)
+        (acc uint)
+    )
+    (match (map-get? application-deadlines { application-id: app-id })
+        deadline-info (if (> stacks-block-height (get deadline deadline-info))
+            (+ acc u1)
+            acc
+        )
+        acc
+    )
+)
+
+(define-private (count-completed
+        (app-id uint)
+        (acc uint)
+    )
+    (match (map-get? applications { id: app-id })
+        app-info (if (and
+                (is-some (map-get? application-deadlines { application-id: app-id }))
+                (or
+                    (is-eq (get status app-info) "accepted")
+                    (is-eq (get status app-info) "rejected")
+                    (is-eq (get status app-info) "withdrawn")
+                )
+            )
+            (+ acc u1)
+            acc
+        )
+        acc
+    )
 )
 
 (define-read-only (get-applications-summary (user principal))
