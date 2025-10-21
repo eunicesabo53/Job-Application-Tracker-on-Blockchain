@@ -3,11 +3,26 @@
 (define-constant err-not-found (err u101))
 (define-constant err-unauthorized (err u102))
 (define-constant err-invalid-status (err u103))
-(define-constant err-already-exists (err u104))
+(define-constant err-deadline-passed (err u111))
+
+;; Skills Tracking Error Constants
+(define-constant err-skill-not-found (err u400))
+(define-constant err-invalid-proficiency (err u401))
+(define-constant err-skill-already-exists (err u402))
+(define-constant err-skill-unauthorized (err u403))
+(define-constant err-requirement-not-found (err u404))
+(define-constant err-invalid-skill-category (err u405))
+
+;; Skill Category Constants
+(define-constant SKILL-TECHNICAL u1)
+(define-constant SKILL-SOFT u2)
+(define-constant SKILL-LANGUAGE u3)
+(define-constant SKILL-CERTIFICATION u4)
 (define-constant err-invalid-params (err u105))
 
 (define-data-var application-id-nonce uint u0)
 (define-data-var employer-id-nonce uint u0)
+(define-data-var skill-id-nonce uint u0)
 
 (define-map applications
     { id: uint }
@@ -65,6 +80,40 @@
     }
 )
 
+;; Skills Tracking Data Maps
+(define-map skills
+    { skill-id: uint }
+    {
+        name: (string-ascii 50),
+        category: uint,
+        created-at: uint,
+    }
+)
+
+(define-map user-skills
+    { user: principal, skill-id: uint }
+    {
+        proficiency: uint,
+        acquired-at: uint,
+        last-updated: uint,
+    }
+)
+
+(define-map application-requirements
+    { application-id: uint, skill-id: uint }
+    {
+        min-proficiency: uint,
+        required: bool,
+    }
+)
+
+(define-map skill-counters
+    { user: principal }
+    {
+        total-skills: uint,
+    }
+)
+
 (define-read-only (get-application (id uint))
     (map-get? applications { id: id })
 )
@@ -99,6 +148,47 @@
 
 (define-read-only (get-application-history (application-id uint))
     (ok application-id)
+)
+
+;; Skills Tracking Read-Only Functions
+(define-read-only (get-skill (skill-id uint))
+    (map-get? skills { skill-id: skill-id })
+)
+
+(define-read-only (get-user-skill (user principal) (skill-id uint))
+    (map-get? user-skills { user: user, skill-id: skill-id })
+)
+
+(define-read-only (get-application-requirement (application-id uint) (skill-id uint))
+    (map-get? application-requirements {
+        application-id: application-id,
+        skill-id: skill-id,
+    })
+)
+
+(define-read-only (get-skill-count)
+    (var-get skill-id-nonce)
+)
+
+(define-read-only (get-user-skill-portfolio (user principal))
+    (default-to { total-skills: u0 }
+        (map-get? skill-counters { user: user })
+    )
+)
+
+(define-read-only (calculate-skill-gap (user principal) (application-id uint))
+    (ok { user: user, application-id: application-id })
+)
+
+(define-read-only (check-requirements-met (user principal) (application-id uint))
+    (ok (and
+        (is-some (map-get? applications { id: application-id }))
+        (> (get total-skills (get-user-skill-portfolio user)) u0)
+    ))
+)
+
+(define-read-only (get-skill-recommendations (user principal) (application-id uint))
+    (ok { user: user, application-id: application-id, recommendations: (list) })
 )
 
 (define-public (register-employer
@@ -309,4 +399,142 @@
         (notes (string-ascii 200))
     )
     (ok (len application-ids))
+)
+
+;; Skills Tracking Public Functions
+(define-public (register-skill
+        (name (string-ascii 50))
+        (category uint)
+    )
+    (let ((new-id (+ (var-get skill-id-nonce) u1)))
+        (asserts!
+            (or
+                (is-eq category SKILL-TECHNICAL)
+                (is-eq category SKILL-SOFT)
+                (is-eq category SKILL-LANGUAGE)
+                (is-eq category SKILL-CERTIFICATION)
+            )
+            err-invalid-skill-category
+        )
+        (asserts!
+            (is-none (map-get? skills { skill-id: new-id }))
+            err-skill-already-exists
+        )
+        (var-set skill-id-nonce new-id)
+        (map-set skills { skill-id: new-id } {
+            name: name,
+            category: category,
+            created-at: stacks-block-height,
+        })
+        (ok new-id)
+    )
+)
+
+(define-public (add-user-skill
+        (skill-id uint)
+        (proficiency uint)
+    )
+    (let (
+            (skill (unwrap! (map-get? skills { skill-id: skill-id }) err-skill-not-found))
+            (current-counters (default-to { total-skills: u0 }
+                (map-get? skill-counters { user: tx-sender })
+            ))
+        )
+        (asserts!
+            (and (>= proficiency u1) (<= proficiency u5))
+            err-invalid-proficiency
+        )
+        (asserts!
+            (is-none (map-get? user-skills { user: tx-sender, skill-id: skill-id }))
+            err-skill-already-exists
+        )
+        (map-set user-skills {
+            user: tx-sender,
+            skill-id: skill-id,
+        } {
+            proficiency: proficiency,
+            acquired-at: stacks-block-height,
+            last-updated: stacks-block-height,
+        })
+        (map-set skill-counters { user: tx-sender } {
+            total-skills: (+ (get total-skills current-counters) u1),
+        })
+        (ok true)
+    )
+)
+
+(define-public (update-skill-proficiency
+        (skill-id uint)
+        (new-proficiency uint)
+    )
+    (let (
+            (user-skill (unwrap!
+                (map-get? user-skills { user: tx-sender, skill-id: skill-id })
+                err-skill-not-found
+            ))
+        )
+        (asserts!
+            (and (>= new-proficiency u1) (<= new-proficiency u5))
+            err-invalid-proficiency
+        )
+        (map-set user-skills {
+            user: tx-sender,
+            skill-id: skill-id,
+        }
+            (merge user-skill {
+                proficiency: new-proficiency,
+                last-updated: stacks-block-height,
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (add-application-requirement
+        (application-id uint)
+        (skill-id uint)
+        (min-proficiency uint)
+    )
+    (let (
+            (app (unwrap! (map-get? applications { id: application-id }) err-not-found))
+            (skill (unwrap! (map-get? skills { skill-id: skill-id }) err-skill-not-found))
+        )
+        (asserts!
+            (is-eq tx-sender (get applicant app))
+            err-skill-unauthorized
+        )
+        (asserts!
+            (and (>= min-proficiency u1) (<= min-proficiency u5))
+            err-invalid-proficiency
+        )
+        (map-set application-requirements {
+            application-id: application-id,
+            skill-id: skill-id,
+        } {
+            min-proficiency: min-proficiency,
+            required: true,
+        })
+        (ok true)
+    )
+)
+
+(define-public (remove-user-skill (skill-id uint))
+    (let (
+            (user-skill (unwrap!
+                (map-get? user-skills { user: tx-sender, skill-id: skill-id })
+                err-skill-not-found
+            ))
+            (current-counters (default-to { total-skills: u0 }
+                (map-get? skill-counters { user: tx-sender })
+            ))
+        )
+        (map-delete user-skills { user: tx-sender, skill-id: skill-id })
+        (map-set skill-counters { user: tx-sender } {
+            total-skills: (if (> (get total-skills current-counters) u0)
+                (- (get total-skills current-counters) u1)
+                u0
+            ),
+        })
+        (ok true)
+    )
 )
