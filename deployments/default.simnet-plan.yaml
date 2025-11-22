@@ -64,4 +64,9 @@ plan:
             emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
             path: contracts/Job-Application-Tracker-on-Blockchain.clar
             clarity-version: 3
+        - emulated-contract-publish:
+            contract-name: application-status-audit
+            emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
+            path: contracts/application-status-audit.clar
+            clarity-version: 3
       epoch: "3.1"
